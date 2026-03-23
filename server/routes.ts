@@ -1,0 +1,521 @@
+import type { Express } from "express";
+import { type Server } from "http";
+import { storage } from "./storage";
+import { api } from "@shared/routes";
+import { setupAuth } from "./auth";
+import { z } from "zod";
+import { courses } from "@shared/schema";
+import { db } from "./db";
+import passport from "passport";
+import crypto from "crypto";
+import { sendVerificationEmail, sendPasswordResetEmail } from "./email";
+import { forgotPasswordSchema, resetPasswordSchema, insertEvaluationPeriodSchema, updateEvaluationPeriodSchema, insertEvaluationCriterionSchema, updateEvaluationCriterionSchema } from "@shared/schema";
+
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "EDURATE_ADMIN_2024";
+
+function isAdmin(req: any) {
+  return req.isAuthenticated() && req.user.role === 'admin';
+}
+
+export async function registerRoutes(httpServer: Server, app: Express): Promise<Server> {
+  const { hashPassword, comparePasswords } = setupAuth(app);
+
+  // === REGISTER ===
+  app.post(api.auth.register.path, async (req, res, next) => {
+    try {
+      const existingUser = await storage.getUserByUsername(req.body.username);
+      if (existingUser) return res.status(400).send({ message: "Username already exists" });
+
+      // Admin secret key check
+      if (req.body.role === 'admin') {
+        if (req.body.adminSecret !== ADMIN_SECRET) {
+          return res.status(403).json({ message: "Invalid admin secret key" });
+        }
+      }
+
+      if (req.body.email) {
+        // Only allow Babcock University email addresses (skip for admin)
+        if (req.body.role !== 'admin') {
+          const emailLower = req.body.email.toLowerCase();
+          const allowedDomains = ['@student.babcock.edu.ng', '@babcock.edu.ng'];
+          const isAllowed = allowedDomains.some(domain => emailLower.endsWith(domain));
+          if (!isAllowed) {
+            return res.status(400).json({ message: "Only Babcock University email addresses are allowed (@student.babcock.edu.ng or @babcock.edu.ng)" });
+          }
+        }
+
+        const existingEmail = await storage.getUserByEmail(req.body.email);
+        if (existingEmail) return res.status(400).json({ message: "An account with this email already exists" });
+      }
+
+      const input = api.auth.register.input.parse(req.body);
+      const courseIds: number[] = req.body.courseIds || [];
+      const hashedPassword = await hashPassword(input.password);
+      const verificationToken = crypto.randomBytes(32).toString("hex");
+
+      const user = await storage.createUser({
+        ...input,
+        courseId: null,
+        password: hashedPassword,
+        email: input.email || "",
+        emailVerified: false,
+        verificationToken,
+        resetPasswordToken: null,
+        resetPasswordExpiry: null,
+      });
+
+      if (input.role === 'lecturer' && courseIds.length > 0) {
+        await storage.setLecturerCourses(user.id, courseIds);
+      }
+
+      if (user.email) {
+        sendVerificationEmail(user.email, verificationToken, user.name).catch(console.error);
+      }
+
+      req.login(user, (err) => {
+        if (err) return next(err);
+        const { password, verificationToken: vt, resetPasswordToken, resetPasswordExpiry, ...safe } = user;
+        res.status(201).json(safe);
+      });
+    } catch (err) {
+      if (err instanceof z.ZodError) return res.status(400).json({ message: err.errors[0].message });
+      next(err);
+    }
+  });
+
+  // === LOGIN ===
+  app.post(api.auth.login.path, (req, res, next) => {
+    passport.authenticate("local", (err: any, user: any, info: any) => {
+      if (err) return next(err);
+      if (!user) return res.status(401).json({ message: "Invalid credentials" });
+      req.login(user, (err: any) => {
+        if (err) return next(err);
+        const { password, verificationToken, resetPasswordToken, resetPasswordExpiry, ...safe } = user;
+        res.json(safe);
+      });
+    })(req, res, next);
+  });
+
+  // === LOGOUT ===
+  app.post(api.auth.logout.path, (req, res, next) => {
+    req.logout((err) => {
+      if (err) return next(err);
+      res.json({ message: "Logged out" });
+    });
+  });
+
+  // === ME ===
+  app.get(api.auth.me.path, (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const { password, verificationToken, resetPasswordToken, resetPasswordExpiry, ...safe } = req.user as any;
+    res.json(safe);
+  });
+
+  // === PROFILE UPDATE (student/lecturer) ===
+  app.put("/api/profile", async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    if (req.user.role !== "student" && req.user.role !== "lecturer") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const schema = z.object({
+      name: z.string().min(2).optional(),
+      currentPassword: z.string().optional(),
+      newPassword: z.string().min(8, "New password must be at least 8 characters").optional(),
+    });
+
+    try {
+      const input = schema.parse(req.body);
+      const updates: Record<string, unknown> = {};
+
+      if (input.name && input.name.trim() !== req.user.name) {
+        updates.name = input.name.trim();
+      }
+
+      if (input.newPassword) {
+        if (!input.currentPassword) {
+          return res.status(400).json({ message: "Current password is required to set a new password." });
+        }
+        const validCurrent = await comparePasswords(input.currentPassword, req.user.password);
+        if (!validCurrent) {
+          return res.status(400).json({ message: "Current password is incorrect." });
+        }
+        updates.password = await hashPassword(input.newPassword);
+      }
+
+      if (Object.keys(updates).length === 0) {
+        return res.status(400).json({ message: "No changes were provided." });
+      }
+
+      const updated = await storage.updateUser(req.user.id, updates as any);
+      const { password, verificationToken, resetPasswordToken, resetPasswordExpiry, ...safe } = updated;
+      res.json(safe);
+    } catch (err) {
+      if (err instanceof z.ZodError) return res.status(400).json({ message: err.errors[0].message });
+      res.status(500).json({ message: "Failed to update profile" });
+    }
+  });
+
+  // === VERIFY EMAIL ===
+  app.get("/api/auth/verify-email/:token", async (req, res) => {
+    try {
+      const user = await storage.getUserByVerificationToken(req.params.token);
+      if (!user) return res.status(400).json({ message: "Invalid or expired verification link" });
+      await storage.updateUser(user.id, { emailVerified: true, verificationToken: null });
+      res.json({ message: "Email verified successfully" });
+    } catch {
+      res.status(500).json({ message: "Verification failed" });
+    }
+  });
+
+  // === FORGOT PASSWORD ===
+  app.post("/api/auth/forgot-password", async (req, res) => {
+    try {
+      const { email } = forgotPasswordSchema.parse(req.body);
+      const user = await storage.getUserByEmail(email);
+      if (!user) return res.json({ message: "If that email exists, a reset link has been sent." });
+      const token = crypto.randomBytes(32).toString("hex");
+      const expiry = new Date(Date.now() + 60 * 60 * 1000);
+      await storage.updateUser(user.id, { resetPasswordToken: token, resetPasswordExpiry: expiry });
+      sendPasswordResetEmail(user.email, token, user.name).catch(console.error);
+      res.json({ message: "If that email exists, a reset link has been sent." });
+    } catch (err) {
+      if (err instanceof z.ZodError) return res.status(400).json({ message: err.errors[0].message });
+      res.status(500).json({ message: "Something went wrong" });
+    }
+  });
+
+  // === RESET PASSWORD ===
+  app.post("/api/auth/reset-password", async (req, res) => {
+    try {
+      const { token, password } = resetPasswordSchema.parse(req.body);
+      const user = await storage.getUserByResetToken(token);
+      if (!user) return res.status(400).json({ message: "Invalid or expired reset link. Please request a new one." });
+      const hashed = await hashPassword(password);
+      await storage.updateUser(user.id, { password: hashed, resetPasswordToken: null, resetPasswordExpiry: null });
+      res.json({ message: "Password reset successfully. You can now log in." });
+    } catch (err) {
+      if (err instanceof z.ZodError) return res.status(400).json({ message: err.errors[0].message });
+      res.status(500).json({ message: "Something went wrong" });
+    }
+  });
+
+  // === COURSES ===
+  app.get(api.courses.list.path, async (req, res) => {
+    const allCourses = await storage.getCourses();
+    res.json(allCourses);
+  });
+
+  // === LECTURERS ===
+  app.get(api.lecturers.list.path, async (req, res) => {
+    const allLecturers = await storage.getLecturers();
+    let filtered = allLecturers;
+    if (req.isAuthenticated() && (req.user as any).role === 'student') {
+      const studentDept = (req.user as any).department;
+      if (studentDept) filtered = allLecturers.filter(l => l.department === studentDept);
+    }
+    const safe = filtered.map(({ password, verificationToken, resetPasswordToken, resetPasswordExpiry, ...rest }) => rest);
+    res.json(safe);
+  });
+
+  // === EVALUATIONS ===
+  app.get(api.evaluations.list.path, async (req, res) => {
+    if (!req.isAuthenticated() || req.user.role !== 'student') return res.status(401).json({ message: "Unauthorized" });
+    const evals = await storage.getEvaluationsByStudent(req.user.id);
+    res.json(evals);
+  });
+
+  app.post(api.evaluations.create.path, async (req, res) => {
+    if (!req.isAuthenticated() || req.user.role !== 'student') return res.status(401).json({ message: "Unauthorized" });
+    try {
+      const activePeriod = await storage.getActiveEvaluationPeriod();
+      if (!activePeriod) {
+        return res.status(403).json({ message: "Evaluations are currently closed. No active evaluation period is set." });
+      }
+
+      const input = api.evaluations.create.input.parse(req.body);
+      const studentDept = (req.user as any).department;
+      if (studentDept) {
+        const allLecturers = await storage.getLecturers();
+        const targetLecturer = allLecturers.find(l => l.id === input.lecturerId);
+        if (!targetLecturer || targetLecturer.department !== studentDept) {
+          return res.status(403).json({ message: "You can only evaluate lecturers in your department" });
+        }
+      }
+
+      // Duplicate submission prevention
+      const alreadySubmitted = await storage.hasStudentEvaluatedLecturerInPeriod(
+        req.user.id, input.lecturerId, input.courseId, activePeriod.id
+      );
+      if (alreadySubmitted) {
+        return res.status(409).json({ message: "You have already submitted an evaluation for this lecturer and course." });
+      }
+
+      const evalData = await storage.createEvaluation({
+        ...input,
+        materialsRating: input.materialsRating ?? 0,
+        organizationRating: input.organizationRating ?? 0,
+        feedbackRating: input.feedbackRating ?? 0,
+        paceRating: input.paceRating ?? 0,
+        supportRating: input.supportRating ?? 0,
+        fairnessRating: input.fairnessRating ?? 0,
+        relevanceRating: input.relevanceRating ?? 0,
+        comments: input.comments ?? null,
+        studentId: req.user.id,
+      });
+      res.status(201).json(evalData);
+    } catch (err) {
+      if (err instanceof z.ZodError) return res.status(400).json({ message: err.errors[0].message });
+      res.status(500).json({ message: "Internal server error" });
+    }
+  });
+
+  // === ACTIVE EVALUATION PERIOD ===
+  app.get(api.evaluationPeriods.active.path, async (req, res) => {
+    if (!req.isAuthenticated()) return res.status(401).json({ message: "Unauthorized" });
+    const activePeriod = await storage.getActiveEvaluationPeriod();
+    res.json(activePeriod ?? null);
+  });
+
+  // === LECTURER DASHBOARD ===
+  app.get(api.dashboard.lecturerSummary.path, async (req, res) => {
+    if (!req.isAuthenticated() || req.user.role !== 'lecturer') return res.status(401).json({ message: "Unauthorized" });
+    const courseIdParam = req.query.courseId ? parseInt(req.query.courseId as string) : undefined;
+    const summary = await storage.getLecturerSummary(req.user.id, courseIdParam);
+    const lecturerCoursesData = await storage.getLecturerCoursesDetails(req.user.id);
+    res.json({ ...summary, courses: lecturerCoursesData });
+  });
+
+  // === LECTURER PROFILE - GET COURSES ===
+  app.get("/api/lecturer/courses", async (req, res) => {
+    if (!req.isAuthenticated() || req.user.role !== 'lecturer') return res.status(401).json({ message: "Unauthorized" });
+    const lecturerCoursesData = await storage.getLecturerCoursesDetails(req.user.id);
+    res.json(lecturerCoursesData);
+  });
+
+  // === LECTURER PROFILE - UPDATE ===
+  app.put("/api/lecturer/profile", async (req, res) => {
+    if (!req.isAuthenticated() || req.user.role !== 'lecturer') return res.status(401).json({ message: "Unauthorized" });
+    try {
+      const { department, courseIds } = req.body;
+      if (!department || !Array.isArray(courseIds) || courseIds.length === 0) {
+        return res.status(400).json({ message: "Department and at least one course are required" });
+      }
+      await storage.updateUser(req.user.id, { department });
+      await storage.setLecturerCourses(req.user.id, courseIds);
+      const updated = await storage.getUser(req.user.id);
+      const { password, verificationToken, resetPasswordToken, resetPasswordExpiry, ...safe } = updated!;
+      res.json(safe);
+    } catch {
+      res.status(500).json({ message: "Failed to update profile" });
+    }
+  });
+
+  // ============================================================
+  // === ADMIN ROUTES ===
+  // ============================================================
+
+  // GET all users
+  app.get("/api/admin/users", async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ message: "Forbidden" });
+    const allUsers = await storage.getAllUsers();
+    const safe = allUsers.map(({ password, verificationToken, resetPasswordToken, resetPasswordExpiry, ...rest }) => rest);
+    res.json(safe);
+  });
+
+  // DELETE a user
+  app.delete("/api/admin/users/:id", async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ message: "Forbidden" });
+    const id = parseInt(req.params.id);
+    if ((req.user as any).id === id) return res.status(400).json({ message: "You cannot delete your own account" });
+    await storage.deleteUser(id);
+    res.json({ message: "User deleted" });
+  });
+
+  // GET all courses (admin)
+  app.get("/api/admin/courses", async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ message: "Forbidden" });
+    const allCourses = await storage.getCourses();
+    res.json(allCourses);
+  });
+
+  // CREATE a course
+  app.post("/api/admin/courses", async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ message: "Forbidden" });
+    const { department, code, name } = req.body;
+    if (!department || !code || !name) return res.status(400).json({ message: "Department, code and name are required" });
+    const course = await storage.createCourse({ department: department.trim(), code: code.trim().toUpperCase(), name: name.trim() });
+    res.status(201).json(course);
+  });
+
+  // DELETE a course
+  app.delete("/api/admin/courses/:id", async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ message: "Forbidden" });
+    await storage.deleteCourse(parseInt(req.params.id));
+    res.json({ message: "Course deleted" });
+  });
+
+  // GET all evaluations (admin)
+  app.get("/api/admin/evaluations", async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ message: "Forbidden" });
+    const allEvals = await storage.getAllEvaluations();
+    const allUsers = await storage.getAllUsers();
+    const allCourses = await storage.getCourses();
+
+    const enriched = allEvals.map(e => ({
+      ...e,
+      studentName: allUsers.find(u => u.id === e.studentId)?.name || "Unknown",
+      lecturerName: allUsers.find(u => u.id === e.lecturerId)?.name || "Unknown",
+      courseName: allCourses.find(c => c.id === e.courseId)?.name || "Unknown",
+      courseCode: allCourses.find(c => c.id === e.courseId)?.code || "Unknown",
+    }));
+    res.json(enriched);
+  });
+
+  // DELETE an evaluation
+  app.delete("/api/admin/evaluations/:id", async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ message: "Forbidden" });
+    await storage.deleteEvaluation(parseInt(req.params.id));
+    res.json({ message: "Evaluation deleted" });
+  });
+
+  // GET all evaluation periods (admin)
+  app.get(api.admin.evaluationPeriods.list.path, async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ message: "Forbidden" });
+    const periods = await storage.getEvaluationPeriods();
+    res.json(periods);
+  });
+
+  // CREATE evaluation period (admin)
+  app.post(api.admin.evaluationPeriods.create.path, async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ message: "Forbidden" });
+    try {
+      const input = insertEvaluationPeriodSchema.parse(req.body);
+      const created = await storage.createEvaluationPeriod({
+        name: input.name,
+        startDate: input.startDate,
+        endDate: input.endDate,
+        isActive: input.isActive ?? true,
+      });
+      res.status(201).json(created);
+    } catch (err) {
+      if (err instanceof z.ZodError) return res.status(400).json({ message: err.errors[0].message });
+      res.status(500).json({ message: "Failed to create evaluation period" });
+    }
+  });
+
+  // UPDATE evaluation period (admin)
+  app.put("/api/admin/evaluation-periods/:id", async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ message: "Forbidden" });
+    try {
+      const periodId = parseInt(req.params.id, 10);
+      const input = updateEvaluationPeriodSchema.parse(req.body);
+      const updated = await storage.updateEvaluationPeriod(periodId, input);
+      if (!updated) return res.status(404).json({ message: "Evaluation period not found" });
+      res.json(updated);
+    } catch (err) {
+      if (err instanceof z.ZodError) return res.status(400).json({ message: err.errors[0].message });
+      res.status(500).json({ message: "Failed to update evaluation period" });
+    }
+  });
+
+  // DELETE evaluation period (admin)
+  app.delete("/api/admin/evaluation-periods/:id", async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ message: "Forbidden" });
+    await storage.deleteEvaluationPeriod(parseInt(req.params.id, 10));
+    res.json({ message: "Evaluation period deleted" });
+  });
+
+  // === EVALUATION CRITERIA (admin) ===
+  app.get("/api/admin/criteria", async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ message: "Forbidden" });
+    const criteria = await storage.getEvaluationCriteria();
+    res.json(criteria);
+  });
+
+  app.post("/api/admin/criteria", async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ message: "Forbidden" });
+    try {
+      const input = insertEvaluationCriterionSchema.parse(req.body);
+      const created = await storage.createEvaluationCriterion({
+        ...input,
+        isActive: input.isActive ?? true,
+        sortOrder: input.sortOrder ?? 0,
+      });
+      res.status(201).json(created);
+    } catch (err) {
+      if (err instanceof z.ZodError) return res.status(400).json({ message: err.errors[0].message });
+      res.status(500).json({ message: "Failed to create criterion" });
+    }
+  });
+
+  app.put("/api/admin/criteria/:id", async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ message: "Forbidden" });
+    try {
+      const input = updateEvaluationCriterionSchema.parse(req.body);
+      const updated = await storage.updateEvaluationCriterion(parseInt(req.params.id, 10), input);
+      if (!updated) return res.status(404).json({ message: "Criterion not found" });
+      res.json(updated);
+    } catch (err) {
+      if (err instanceof z.ZodError) return res.status(400).json({ message: err.errors[0].message });
+      res.status(500).json({ message: "Failed to update criterion" });
+    }
+  });
+
+  app.delete("/api/admin/criteria/:id", async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ message: "Forbidden" });
+    await storage.deleteEvaluationCriterion(parseInt(req.params.id, 10));
+    res.json({ message: "Criterion deleted" });
+  });
+
+  // === ADMIN ANALYTICS SUMMARY (for admin report export / charts) ===
+  app.get("/api/admin/analytics", async (req, res) => {
+    if (!isAdmin(req)) return res.status(403).json({ message: "Forbidden" });
+    const allEvals = await storage.getAllEvaluations();
+    const allUsers = await storage.getAllUsers();
+    const allCourses = await storage.getCourses();
+
+    // Per-lecturer aggregated summary
+    const lecturers = allUsers.filter(u => u.role === 'lecturer');
+    const summary = await Promise.all(lecturers.map(async (lec) => {
+      const stats = await storage.getLecturerSummary(lec.id);
+      const lecCourses = await storage.getLecturerCoursesDetails(lec.id);
+      return {
+        lecturerId: lec.id,
+        lecturerName: lec.name,
+        department: lec.department,
+        courses: lecCourses.map(c => c.code).join(', '),
+        ...stats,
+      };
+    }));
+
+    res.json({
+      totalEvaluations: allEvals.length,
+      totalLecturers: lecturers.length,
+      totalStudents: allUsers.filter(u => u.role === 'student').length,
+      totalCourses: allCourses.length,
+      perLecturer: summary,
+    });
+  });
+
+  await seedDatabase();
+  return httpServer;
+}
+
+async function seedDatabase() {
+  const existingCourses = await storage.getCourses();
+  if (existingCourses.length === 0) {
+    await db.insert(courses).values([
+      { department: 'Computer Science', code: 'CS101', name: 'Intro to Computer Science' },
+      { department: 'Computer Science', code: 'CS201', name: 'Data Structures' },
+      { department: 'Computer Science', code: 'CS301', name: 'Algorithms' },
+      { department: 'Mathematics', code: 'MATH101', name: 'Calculus I' },
+      { department: 'Mathematics', code: 'MATH201', name: 'Linear Algebra' },
+      { department: 'Mathematics', code: 'MATH301', name: 'Complex Analysis' },
+      { department: 'Physics', code: 'PHYS101', name: 'Physics I' },
+      { department: 'Physics', code: 'PHYS201', name: 'Quantum Mechanics' },
+      { department: 'Biology', code: 'BIO101', name: 'General Biology' },
+      { department: 'Biology', code: 'BIO302', name: 'Genetics' },
+    ]);
+  }
+}

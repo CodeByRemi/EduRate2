@@ -1,0 +1,85 @@
+@import url("https://fonts.googleapis.com/css2?family=Lexend:wght@300;400;500;600;700;800&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --font-sans: "Lexend", sans-serif;
+    --font-display: "Lexend", sans-serif;
+
+    /* Base / Neutral */
+    --background: 220 20% 97%;
+    --foreground: 222 47% 11%;
+
+    /* Card / Surface */
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --card-border: 214 32% 91%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+    --popover-border: 214 32% 91%;
+
+    /* Theme Colors: Blue to Indigo */
+    --primary: 222 64% 33%;
+    --primary-foreground: 210 40% 98%;
+
+    --secondary: 220 24% 93%;
+    --secondary-foreground: 222 47% 11%;
+
+    --muted: 220 25% 95%;
+    --muted-foreground: 215 16% 47%;
+
+    --accent: 45 64% 52%;
+    --accent-foreground: 222 47% 11%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 220 24% 89%;
+    --input: 220 24% 89%;
+    --ring: 222 64% 33%;
+
+    /* Charts */
+    --chart-1: 222 64% 33%;
+    --chart-2: 45 64% 52%;
+    --chart-3: 195 75% 40%;
+    --chart-4: 146 64% 38%;
+    --chart-5: 26 82% 44%;
+
+    --radius: 1rem;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased min-h-screen;
+    font-family: var(--font-sans);
+  }
+
+  h1,
+  h2,
+  h3,
+  h4,
+  h5,
+  h6 {
+    font-family: var(--font-display);
+    @apply tracking-tight;
+  }
+}
+
+@layer utilities {
+  .text-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-slate-800 to-amber-600;
+  }
+
+  .bg-glass {
+    @apply bg-white/80 backdrop-blur-md border border-white/20;
+  }
+
+  .shadow-soft {
+    box-shadow:
+      0 8px 24px rgba(15, 23, 42, 0.08),
+      0 4px 8px rgba(15, 23, 42, 0.05);
+  }
+}
